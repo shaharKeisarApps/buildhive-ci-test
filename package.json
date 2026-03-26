@@ -1,0 +1,12 @@
+{
+  "name": "buildhive-ci-test",
+  "version": "1.0.0",
+  "description": "Test project for BuildHive CI platform dogfooding",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js",
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "license": "MIT"
+}
