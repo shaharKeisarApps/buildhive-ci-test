@@ -66,7 +66,7 @@ jobs:
 
           while [ $ELAPSED -lt $MAX_WAIT ]; do
             RESPONSE=$(curl -s -X GET \
-              "${{ secrets.BUILDHIVE_SERVER_URL }}/api/jobs/$JOB_ID/status" \
+              "${{ secrets.BUILDHIVE_SERVER_URL }}/api/jobs/$JOB_ID" \
               -H "Authorization: Bearer ${{ secrets.BUILDHIVE_API_KEY }}" 2>/dev/null || echo '{"status":"POLLING_ERROR"}')
 
             STATUS=$(echo "$RESPONSE" | jq -r '.job.status // .status // "UNKNOWN"')
