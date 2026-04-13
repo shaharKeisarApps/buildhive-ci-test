@@ -1,0 +1,126 @@
+name: BuildHive Smoke Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      fallback-timeout:
+        description: 'Fallback timeout in minutes (how long to wait for agent)'
+        required: false
+        default: '3'
+
+jobs:
+  buildhive-smoke:
+    name: Smoke Test (via BuildHive)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Submit job to BuildHive
+        id: submit
+        run: |
+          echo "Submitting job to BuildHive server..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.BUILDHIVE_SERVER_URL }}/api/jobs" \
+            -H "Authorization: Bearer ${{ secrets.BUILDHIVE_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "externalId": "smoke-${{ github.run_id }}-${{ github.run_number }}",
+              "source": "GITHUB_ACTIONS",
+              "repository": "${{ github.repository }}",
+              "branch": "${{ github.ref_name }}",
+              "commitSha": "${{ github.sha }}",
+              "buildCommand": "npm install && npm test",
+              "dockerImage": "node:20-alpine",
+              "jobType": "BUILD",
+              "environment": {"CI": "true", "BUILDHIVE_SMOKE": "true"},
+              "estimatedDuration": 60
+            }')
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            JOB_ID=$(echo "$BODY" | jq -r '.jobId')
+            echo "job-id=$JOB_ID" >> $GITHUB_OUTPUT
+            echo "submitted=true" >> $GITHUB_OUTPUT
+            echo "Job submitted! ID: $JOB_ID"
+          else
+            echo "submitted=false" >> $GITHUB_OUTPUT
+            echo "::warning::Job submission failed: $BODY"
+          fi
+
+      - name: Monitor job (poll for completion)
+        if: steps.submit.outputs.submitted == 'true'
+        id: monitor
+        run: |
+          JOB_ID="${{ steps.submit.outputs.job-id }}"
+          TIMEOUT=${{ inputs.fallback-timeout || '3' }}
+          MAX_WAIT=$((TIMEOUT * 60))
+          ELAPSED=0
+          POLL_INTERVAL=5
+
+          echo "Monitoring job $JOB_ID (timeout: ${TIMEOUT}m)..."
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            RESPONSE=$(curl -s -X GET \
+              "${{ secrets.BUILDHIVE_SERVER_URL }}/api/jobs/$JOB_ID/status" \
+              -H "Authorization: Bearer ${{ secrets.BUILDHIVE_API_KEY }}" 2>/dev/null || echo '{"status":"POLLING_ERROR"}')
+
+            STATUS=$(echo "$RESPONSE" | jq -r '.job.status // .status // "UNKNOWN"')
+            echo "[${ELAPSED}s] Job status: $STATUS"
+
+            case "$STATUS" in
+              COMPLETED)
+                EXIT_CODE=$(echo "$RESPONSE" | jq -r '.job.exitCode // 0')
+                DURATION=$(echo "$RESPONSE" | jq -r '.job.actualDuration // "N/A"')
+                AGENT=$(echo "$RESPONSE" | jq -r '.job.agent.name // .job.agentId // "unknown"')
+                echo "status=COMPLETED" >> $GITHUB_OUTPUT
+                echo "exit-code=$EXIT_CODE" >> $GITHUB_OUTPUT
+                echo "duration=$DURATION" >> $GITHUB_OUTPUT
+                echo "agent=$AGENT" >> $GITHUB_OUTPUT
+                echo ""
+                echo "Job COMPLETED in ${DURATION}s on agent: $AGENT (exit: $EXIT_CODE)"
+                exit 0
+                ;;
+              FAILED)
+                ERROR=$(echo "$RESPONSE" | jq -r '.job.errorMessage // "Unknown error"')
+                echo "status=FAILED" >> $GITHUB_OUTPUT
+                echo "::error::Job FAILED: $ERROR"
+                exit 1
+                ;;
+              FALLBACK)
+                echo "status=FALLBACK" >> $GITHUB_OUTPUT
+                echo "::warning::Job fell back (no agent available)"
+                break
+                ;;
+            esac
+
+            sleep $POLL_INTERVAL
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+          done
+
+          echo "status=TIMEOUT" >> $GITHUB_OUTPUT
+          echo "::warning::Job did not complete within ${TIMEOUT}m — falling back to local"
+
+      - name: Fallback - Run locally
+        if: steps.submit.outputs.submitted != 'true' || steps.monitor.outputs.status == 'TIMEOUT' || steps.monitor.outputs.status == 'FALLBACK'
+        run: |
+          echo "::notice::Running build locally (fallback mode)"
+          npm install
+          npm test
+
+      - name: Report
+        if: always()
+        run: |
+          echo "### BuildHive Smoke Test Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Job ID | ${{ steps.submit.outputs.job-id || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ steps.monitor.outputs.status || 'FALLBACK' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Duration | ${{ steps.monitor.outputs.duration || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Agent | ${{ steps.monitor.outputs.agent || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Exit Code | ${{ steps.monitor.outputs.exit-code || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
