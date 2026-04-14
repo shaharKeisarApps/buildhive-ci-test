@@ -1,0 +1,111 @@
+name: BuildHive CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  buildhive-test:
+    name: Test (via BuildHive)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Submit to BuildHive
+        id: submit
+        run: |
+          echo "Submitting CI job to BuildHive..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.BUILDHIVE_SERVER_URL }}/api/jobs" \
+            -H "Authorization: Bearer ${{ secrets.BUILDHIVE_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "externalId": "ci-${{ github.run_id }}-${{ github.run_number }}",
+              "source": "GITHUB_ACTIONS",
+              "repository": "${{ github.repository }}",
+              "branch": "${{ github.head_ref || github.ref_name }}",
+              "commitSha": "${{ github.event.pull_request.head.sha || github.sha }}",
+              "buildCommand": "npm install && npm test",
+              "dockerImage": "node:20-alpine",
+              "jobType": "BUILD",
+              "environment": {
+                "CI": "true",
+                "GITHUB_RUN_ID": "${{ github.run_id }}",
+                "GITHUB_EVENT": "${{ github.event_name }}"
+              },
+              "estimatedDuration": 60
+            }')
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            JOB_ID=$(echo "$BODY" | jq -r '.jobId')
+            echo "job-id=$JOB_ID" >> $GITHUB_OUTPUT
+            echo "submitted=true" >> $GITHUB_OUTPUT
+            echo "Job submitted: $JOB_ID"
+          else
+            echo "submitted=false" >> $GITHUB_OUTPUT
+            echo "::warning::BuildHive submission failed ($HTTP_CODE): $BODY"
+          fi
+
+      - name: Wait for BuildHive result
+        if: steps.submit.outputs.submitted == 'true'
+        id: wait
+        run: |
+          JOB_ID="${{ steps.submit.outputs.job-id }}"
+          MAX_WAIT=180
+          ELAPSED=0
+
+          echo "Waiting for job $JOB_ID (max ${MAX_WAIT}s)..."
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            RESP=$(curl -s "${{ secrets.BUILDHIVE_SERVER_URL }}/api/jobs/$JOB_ID" \
+              -H "Authorization: Bearer ${{ secrets.BUILDHIVE_API_KEY }}" 2>/dev/null)
+
+            STATUS=$(echo "$RESP" | jq -r '.job.status // "UNKNOWN"' 2>/dev/null)
+
+            if [ "$STATUS" = "COMPLETED" ]; then
+              DURATION=$(echo "$RESP" | jq -r '.job.actualDuration // "?"')
+              AGENT=$(echo "$RESP" | jq -r '.job.agent.name // .job.agentId // "unknown"')
+              EXIT_CODE=$(echo "$RESP" | jq -r '.job.exitCode // 0')
+              echo "status=COMPLETED" >> $GITHUB_OUTPUT
+              echo "duration=$DURATION" >> $GITHUB_OUTPUT
+              echo "agent=$AGENT" >> $GITHUB_OUTPUT
+              echo ""
+              echo "BuildHive job COMPLETED in ${DURATION}s (agent: $AGENT, exit: $EXIT_CODE)"
+              exit 0
+            elif [ "$STATUS" = "FAILED" ]; then
+              ERROR=$(echo "$RESP" | jq -r '.job.errorMessage // "unknown"')
+              echo "status=FAILED" >> $GITHUB_OUTPUT
+              echo "::error::BuildHive job FAILED: $ERROR"
+              exit 1
+            fi
+
+            sleep 5
+            ELAPSED=$((ELAPSED + 5))
+          done
+
+          echo "status=TIMEOUT" >> $GITHUB_OUTPUT
+
+      - name: Fallback to GitHub Actions
+        if: steps.submit.outputs.submitted != 'true' || steps.wait.outputs.status == 'TIMEOUT'
+        run: |
+          echo "::notice::Running locally (BuildHive fallback)"
+          npm install
+          npm test
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### BuildHive CI Report" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Job ID | \`${{ steps.submit.outputs.job-id || 'N/A' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ steps.wait.outputs.status || 'FALLBACK' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Duration | ${{ steps.wait.outputs.duration || 'N/A' }}s |" >> $GITHUB_STEP_SUMMARY
+          echo "| Agent | ${{ steps.wait.outputs.agent || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Event | \`${{ github.event_name }}\` |" >> $GITHUB_STEP_SUMMARY
